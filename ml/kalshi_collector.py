@@ -94,12 +94,10 @@ class KalshiCollector:
 
         outcome = 1 if result == "yes" else 0
         last_price = float(m.get("last_price_dollars") or 0)
-        if last_price <= 0.01 or last_price >= 0.99:
-            return None  # already resolved at extreme
+        if last_price <= 0 or last_price >= 0.99:
+            return None  # no price data or already resolved
 
         open_interest = float(m.get("open_interest_fp") or 0)
-        if open_interest < 10:
-            return None  # too thin
 
         # Parse dates
         close_time = m.get("close_time") or m.get("expiration_time")

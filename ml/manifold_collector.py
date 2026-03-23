@@ -60,19 +60,18 @@ class ManifoldCollector:
 
     async def _fetch_resolved(self, limit: int) -> list:
         markets = []
-        before = None
+        offset = 0
         while len(markets) < limit:
-            params = {"limit": 500, "filter": "resolved", "sort": "last-updated"}
-            if before:
-                params["before"] = before
+            params = {"limit": 500, "filter": "resolved", "sort": "last-updated", "offset": offset}
             try:
                 r = await self.client.get(f"{MANIFOLD_API}/search-markets", params=params)
                 batch = r.json()
                 if not isinstance(batch, list) or not batch:
                     break
                 markets.extend(batch)
-                # Use last item's ID as cursor
-                before = batch[-1].get("id")
+                offset += len(batch)
+                if len(batch) < 500:
+                    break  # no more data
                 if len(markets) % 5000 == 0:
                     log.info(f"[MANIFOLD] Fetched {len(markets)} markets...")
                 await asyncio.sleep(0.15)  # rate limit: 500 req/min
@@ -105,7 +104,7 @@ class ManifoldCollector:
 
         volume = float(m.get("volume") or 0)
         bettors = m.get("uniqueBettorCount") or 0
-        if bettors < 3:
+        if bettors < 2:
             return None  # too few participants
 
         # Parse dates
