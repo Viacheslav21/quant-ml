@@ -1,0 +1,47 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.log
+.DS_Store
+.claude/
+model.json
+# Secrets
+.env
+*.pem
+*.key
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+env/
+
+# Logs
+*.log
+logs/
+
+# Database
+*.db
+*.sqlite3
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Docs (internal plans, not for public repo)
+docs/
+
+# Claude Code
+.claude/
+
