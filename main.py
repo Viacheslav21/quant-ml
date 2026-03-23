@@ -99,8 +99,80 @@ async def run_train() -> dict:
 
 
 async def run_serve():
-    log.info("Inference API not implemented yet (Sprint 3)")
-    # TODO: FastAPI endpoint GET /predict?features=...
+    import uvicorn
+    from fastapi import FastAPI, Query
+    from utils.db import Database
+    from ml.signal_model import SignalModel
+
+    app = FastAPI(title="Quant ML", docs_url="/")
+    model = SignalModel()
+    db = Database()
+
+    @app.on_event("startup")
+    async def startup():
+        await db.init()
+        model_bytes, metrics = await db.load_model()
+        if model_bytes:
+            model.load_bytes(model_bytes)
+            log.info(f"[SERVE] Model loaded. Metrics: Brier={metrics.get('test_brier')}, Acc={metrics.get('test_accuracy')}")
+        else:
+            log.warning("[SERVE] No model in DB — predictions will return defaults")
+
+    @app.on_event("shutdown")
+    async def shutdown():
+        await db.close()
+
+    @app.get("/predict")
+    async def predict(
+        yes_price: float = Query(...),
+        theme: str = Query("other"),
+        volume: float = Query(0),
+        days_to_expiry: int = Query(7),
+        market_age_days: float = Query(None),
+        price_momentum_7d: float = Query(None),
+        price_momentum_1d: float = Query(None),
+        price_volatility_7d: float = Query(None),
+        volume_per_day: float = Query(None),
+        neg_risk: bool = Query(False),
+        question_length: int = Query(50),
+        has_numbers: bool = Query(False),
+        spread: float = Query(None),
+    ):
+        features = {
+            "yes_price": yes_price,
+            "theme": theme,
+            "volume": volume,
+            "days_before_expiry": days_to_expiry,
+            "market_age_days": market_age_days,
+            "price_momentum_7d": price_momentum_7d,
+            "price_momentum_1d": price_momentum_1d,
+            "price_volatility_7d": price_volatility_7d,
+            "volume_per_day": volume_per_day,
+            "neg_risk": neg_risk,
+            "question_length": question_length,
+            "has_numbers": has_numbers,
+            "spread": spread,
+        }
+        result = model.predict(features)
+        return result
+
+    @app.get("/health")
+    async def health():
+        has_model = model.model is not None
+        has_mispricing = model.mispricing_model is not None
+        count = await db.get_training_count()
+        return {
+            "status": "ok" if has_model else "no_model",
+            "model_loaded": has_model,
+            "mispricing_loaded": has_mispricing,
+            "training_samples": count,
+        }
+
+    port = int(os.getenv("PORT", "8080"))
+    log.info(f"[SERVE] Starting on port {port}")
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
 
 
 async def main():

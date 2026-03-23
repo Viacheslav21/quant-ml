@@ -146,6 +146,9 @@ class SignalModel:
         """Predict P(YES) and P(mispriced) for a single market."""
         row = self._features_to_row(features)
         df = pd.DataFrame([row])[FEATURES]
+        # Ensure numeric types (None → NaN, object → float)
+        for col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
         result = {"p_yes": 0.5, "p_mispriced": 0.0}
         if self.model is not None:
             result["p_yes"] = float(self.model.predict_proba(df)[:, 1][0])

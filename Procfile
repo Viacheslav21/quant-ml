@@ -1,1 +1,1 @@
-worker: python main.py all
+web: python main.py serve
