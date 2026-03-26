@@ -76,21 +76,15 @@ class SignalModel:
         X_test = test_df[FEATURES]
         y_test = test_df["outcome"]
 
-        base_model = xgb.XGBClassifier(
+        self.model = xgb.XGBClassifier(
             n_estimators=300, max_depth=5, learning_rate=0.03,
             objective="binary:logistic", eval_metric="logloss",
             tree_method="hist", random_state=42, verbosity=0,
             subsample=0.8, colsample_bytree=0.8,  # regularization
             min_child_weight=5,
         )
-        base_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
-
-        # Platt scaling for calibrated probabilities
-        self.model = CalibratedClassifierCV(base_model, cv="prefit", method="sigmoid")
-        self.model.fit(X_test, y_test)
+        self.model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
         p_test = self.model.predict_proba(X_test)[:, 1]
-        # Keep base model for save/load (CalibratedCV can't serialize directly)
-        self._base_model = base_model
 
         # ── Model 2: P(market is significantly wrong) ──
         # Target: was the market confident but wrong?
@@ -201,15 +195,8 @@ class SignalModel:
         """Serialize both models to bytes for DB storage."""
         import tempfile, os, json as _json
         models = {}
-        # Save base XGBoost models (CalibratedCV wraps these)
-        for name, model in [("main", getattr(self, "_base_model", self.model)),
-                            ("mispricing", self.mispricing_model)]:
-            if model is None:
-                continue
-            # CalibratedClassifierCV → get the underlying estimator
-            if hasattr(model, "estimator"):
-                model = model.estimator
-            if not hasattr(model, "save_model"):
+        for name, model in [("main", self.model), ("mispricing", self.mispricing_model)]:
+            if model is None or not hasattr(model, "save_model"):
                 continue
             with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
                 tmp_path = f.name
