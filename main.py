@@ -137,6 +137,12 @@ async def run_serve():
         question_length: int = Query(50),
         has_numbers: bool = Query(False),
         spread: float = Query(None),
+        # New v2 features from engine
+        hurst: float = Query(None),
+        book_imbalance: float = Query(None),
+        contrarian_conf: float = Query(None),
+        n_evidence: int = Query(None),
+        volume_ratio: float = Query(None),
     ):
         features = {
             "yes_price": yes_price,
@@ -152,6 +158,11 @@ async def run_serve():
             "question_length": question_length,
             "has_numbers": has_numbers,
             "spread": spread,
+            "hurst": hurst,
+            "book_imbalance": book_imbalance,
+            "contrarian_conf": contrarian_conf,
+            "n_evidence": n_evidence,
+            "volume_ratio": volume_ratio,
         }
         result = model.predict(features)
         return result

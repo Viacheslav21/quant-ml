@@ -15,6 +15,7 @@ from sklearn.metrics import brier_score_loss, log_loss, accuracy_score
 log = logging.getLogger("ml_model")
 
 FEATURES = [
+    # Original features
     "yes_price",
     "volume",
     "days_before_expiry",
@@ -29,12 +30,20 @@ FEATURES = [
     "question_length",
     "has_numbers",
     "spread",
+    # New features from engine (v2)
+    "hurst",              # Hurst exponent: trending vs mean-reverting
+    "book_imbalance",     # Order book bid/ask imbalance [-1, 1]
+    "contrarian_conf",    # Contrarian signal confidence [0, 1]
+    "n_evidence",         # Number of active evidence sources
+    "volume_ratio",       # Current vs average volume ratio
 ]
 
 THEME_MAP = {
     "crypto": 0, "other": 1, "war": 2, "iran": 3, "israel": 4,
     "trump": 5, "election": 6, "oil": 7, "gold": 8, "fed": 9,
     "ukraine": 10, "russia": 11, "china": 12, "peace": 13,
+    "social": 14, "tech": 15, "military": 16, "geopolitics": 17,
+    "stocks": 18, "usgov": 19, "celeb": 20,
 }
 
 
@@ -67,13 +76,21 @@ class SignalModel:
         X_test = test_df[FEATURES]
         y_test = test_df["outcome"]
 
-        self.model = xgb.XGBClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
+        base_model = xgb.XGBClassifier(
+            n_estimators=300, max_depth=5, learning_rate=0.03,
             objective="binary:logistic", eval_metric="logloss",
             tree_method="hist", random_state=42, verbosity=0,
+            subsample=0.8, colsample_bytree=0.8,  # regularization
+            min_child_weight=5,
         )
-        self.model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+        base_model.fit(X_train, y_train, eval_set=[(X_test, y_test)], verbose=False)
+
+        # Platt scaling for calibrated probabilities
+        self.model = CalibratedClassifierCV(base_model, cv="prefit", method="sigmoid")
+        self.model.fit(X_test, y_test)
         p_test = self.model.predict_proba(X_test)[:, 1]
+        # Keep base model for save/load (CalibratedCV can't serialize directly)
+        self._base_model = base_model
 
         # ── Model 2: P(market is significantly wrong) ──
         # Target: was the market confident but wrong?
@@ -87,16 +104,19 @@ class SignalModel:
         y_train_mis = train_mis["mispriced"]
         y_test_mis = test_mis["mispriced"]
 
-        self.mispricing_model = xgb.XGBClassifier(
-            n_estimators=200, max_depth=4, learning_rate=0.05,
+        base_mis = xgb.XGBClassifier(
+            n_estimators=300, max_depth=5, learning_rate=0.03,
             objective="binary:logistic", eval_metric="logloss",
             tree_method="hist", random_state=42, verbosity=0,
+            subsample=0.8, colsample_bytree=0.8,
+            min_child_weight=5,
         )
-        self.mispricing_model.fit(
+        base_mis.fit(
             train_mis[FEATURES], y_train_mis,
             eval_set=[(test_mis[FEATURES], y_test_mis)], verbose=False,
         )
-        p_test_mis = self.mispricing_model.predict_proba(test_mis[FEATURES])[:, 1]
+        self.mispricing_model = base_mis
+        p_test_mis = base_mis.predict_proba(test_mis[FEATURES])[:, 1]
 
         # ── Metrics ──
         self.metrics = {
@@ -160,8 +180,15 @@ class SignalModel:
         """Serialize both models to bytes for DB storage."""
         import tempfile, os, json as _json
         models = {}
-        for name, model in [("main", self.model), ("mispricing", self.mispricing_model)]:
+        # Save base XGBoost models (CalibratedCV wraps these)
+        for name, model in [("main", getattr(self, "_base_model", self.model)),
+                            ("mispricing", self.mispricing_model)]:
             if model is None:
+                continue
+            # CalibratedClassifierCV → get the underlying estimator
+            if hasattr(model, "estimator"):
+                model = model.estimator
+            if not hasattr(model, "save_model"):
                 continue
             with tempfile.NamedTemporaryFile(suffix=".json", delete=False) as f:
                 tmp_path = f.name

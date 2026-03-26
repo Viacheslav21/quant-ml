@@ -61,6 +61,20 @@ class Database:
                 CREATE INDEX IF NOT EXISTS idx_ml_training_outcome ON ml_training_data(outcome);
                 CREATE INDEX IF NOT EXISTS idx_ml_training_theme ON ml_training_data(theme);
             """)
+            # Migrations for new columns
+            cols = await conn.fetch(
+                "SELECT column_name FROM information_schema.columns WHERE table_name='ml_training_data'"
+            )
+            col_names = {r["column_name"] for r in cols}
+            for col, typ in [
+                ("question_length", "INTEGER"),
+                ("has_numbers", "BOOLEAN DEFAULT FALSE"),
+                ("spread", "REAL"),
+                ("mispricing", "REAL"),
+            ]:
+                if col.split()[0] not in col_names:
+                    await conn.execute(f"ALTER TABLE ml_training_data ADD COLUMN {col} {typ}")
+                    log.info(f"[DB] Added {col} to ml_training_data")
 
     async def save_training_batch(self, samples: list) -> int:
         if not samples:
