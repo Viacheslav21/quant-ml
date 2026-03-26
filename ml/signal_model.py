@@ -170,10 +170,31 @@ class SignalModel:
         for col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
         result = {"p_yes": 0.5, "p_mispriced": 0.0}
+
+        # Use only features the model was trained on (handles old 14-feature models)
+        def _safe_predict(model, data):
+            if hasattr(model, "feature_names_in_"):
+                cols = list(model.feature_names_in_)
+            elif hasattr(model, "get_booster"):
+                cols = model.get_booster().feature_names
+            else:
+                cols = list(data.columns)
+            # Only keep columns model knows; add missing as NaN
+            for c in cols:
+                if c not in data.columns:
+                    data[c] = np.nan
+            return model.predict_proba(data[cols])[:, 1][0]
+
         if self.model is not None:
-            result["p_yes"] = float(self.model.predict_proba(df)[:, 1][0])
+            try:
+                result["p_yes"] = float(_safe_predict(self.model, df.copy()))
+            except Exception as e:
+                log.warning(f"[MODEL] P(YES) predict failed: {e}")
         if self.mispricing_model is not None:
-            result["p_mispriced"] = float(self.mispricing_model.predict_proba(df)[:, 1][0])
+            try:
+                result["p_mispriced"] = float(_safe_predict(self.mispricing_model, df.copy()))
+            except Exception as e:
+                log.warning(f"[MODEL] Mispricing predict failed: {e}")
         return result
 
     def save_bytes(self) -> bytes:
