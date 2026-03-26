@@ -187,7 +187,7 @@ async def run_serve():
 
 
 async def main():
-    mode = sys.argv[1] if len(sys.argv) > 1 else os.getenv("ML_MODE", "serve")
+    mode = os.getenv("ML_MODE") or (sys.argv[1] if len(sys.argv) > 1 else "serve")
     log.info(f"QUANT ML — mode: {mode}")
 
     if mode == "collect":
