@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-QUANT ML — Data collection, model training, and inference service.
-
-Modes:
-  python main.py collect   — Fetch historical data from Polymarket
-  python main.py train     — Train XGBoost model on collected data
-  python main.py serve     — Start inference API (FastAPI)
-  python main.py all       — Collect + Train + Serve
+QUANT ML — XGBoost inference server with collect/train API.
+Always runs as HTTP server. Training triggered via /api/train endpoint (from dashboard).
 """
 
 import asyncio
 import logging
-import sys
 import os
+import json as _json
+from datetime import datetime, timezone
+
+import uvicorn
+from fastapi import FastAPI, Query, BackgroundTasks
+from fastapi.responses import JSONResponse
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,285 +24,234 @@ logging.basicConfig(
 )
 log = logging.getLogger("quant-ml")
 
+from utils.db import Database
+from ml.signal_model import SignalModel
 
-async def run_collect() -> dict:
-    from utils.db import Database
-    from ml.data_collector import MLDataCollector
-    from ml.kalshi_collector import KalshiCollector
-    from ml.manifold_collector import ManifoldCollector
+# ── Global state ──
+app = FastAPI(title="Quant ML", docs_url="/")
+model = SignalModel()
+db = Database()
 
-    db = Database()
+_training_status = {
+    "running": False,
+    "phase": "idle",       # idle, collecting_polymarket, collecting_kalshi, collecting_manifold, training, done, error
+    "progress": "",
+    "started_at": None,
+    "finished_at": None,
+    "result": None,
+    "error": None,
+}
+
+
+# ── Startup / Shutdown ──
+
+@app.on_event("startup")
+async def startup():
     await db.init()
+    model_bytes, metrics = await db.load_model()
+    if model_bytes:
+        model.load_bytes(model_bytes)
+        log.info(f"[SERVE] Model loaded. Brier={metrics.get('test_brier')}, Acc={metrics.get('test_accuracy')}")
+    else:
+        log.warning("[SERVE] No model in DB")
+
+
+@app.on_event("shutdown")
+async def shutdown():
+    await db.close()
+
+
+# ── Predict endpoint ──
+
+@app.get("/predict")
+async def predict(
+    yes_price: float = Query(...), theme: str = Query("other"),
+    volume: float = Query(0), days_to_expiry: int = Query(7),
+    market_age_days: float = Query(None), price_momentum_7d: float = Query(None),
+    price_momentum_1d: float = Query(None), price_volatility_7d: float = Query(None),
+    volume_per_day: float = Query(None), neg_risk: bool = Query(False),
+    question_length: int = Query(50), has_numbers: bool = Query(False),
+    spread: float = Query(None), hurst: float = Query(None),
+    book_imbalance: float = Query(None), contrarian_conf: float = Query(None),
+    n_evidence: int = Query(None), volume_ratio: float = Query(None),
+):
+    features = {
+        "yes_price": yes_price, "theme": theme, "volume": volume,
+        "days_before_expiry": days_to_expiry, "market_age_days": market_age_days,
+        "price_momentum_7d": price_momentum_7d, "price_momentum_1d": price_momentum_1d,
+        "price_volatility_7d": price_volatility_7d, "volume_per_day": volume_per_day,
+        "neg_risk": neg_risk, "question_length": question_length,
+        "has_numbers": has_numbers, "spread": spread, "hurst": hurst,
+        "book_imbalance": book_imbalance, "contrarian_conf": contrarian_conf,
+        "n_evidence": n_evidence, "volume_ratio": volume_ratio,
+    }
+    return model.predict(features)
+
+
+# ── Health / Status ──
+
+@app.get("/health")
+async def health():
+    count = await db.get_training_count()
+    return {
+        "status": "training" if _training_status["running"] else "ok",
+        "model_loaded": model.model is not None,
+        "mispricing_loaded": model.mispricing_model is not None,
+        "training_samples": count,
+    }
+
+
+@app.get("/api/training-status")
+async def training_status():
+    return _training_status
+
+
+# ── Train API (called from dashboard) ──
+
+async def _run_collect_and_train():
+    """Background task: collect data + train model."""
+    global _training_status
+    _training_status["running"] = True
+    _training_status["started_at"] = datetime.now(timezone.utc).isoformat()
+    _training_status["error"] = None
+    _training_status["result"] = None
+
     stats = {"polymarket": 0, "kalshi": 0, "manifold": 0}
+
     try:
-        log.info("=" * 40 + " POLYMARKET " + "=" * 40)
+        # 1. Collect Polymarket
+        _training_status["phase"] = "collecting_polymarket"
+        _training_status["progress"] = "Starting Polymarket..."
+        from ml.data_collector import MLDataCollector
         poly = MLDataCollector(db)
         stats["polymarket"] = await poly.collect(max_markets=40000)
         await poly.close()
+        _training_status["progress"] = f"Polymarket: {stats['polymarket']} new samples"
 
-        log.info("=" * 40 + " KALSHI " + "=" * 40)
+        # 2. Collect Kalshi
+        _training_status["phase"] = "collecting_kalshi"
+        _training_status["progress"] = "Starting Kalshi..."
+        from ml.kalshi_collector import KalshiCollector
         kalshi = KalshiCollector(db)
         stats["kalshi"] = await kalshi.collect(max_markets=40000)
         await kalshi.close()
+        _training_status["progress"] = f"Kalshi: {stats['kalshi']} new samples"
 
-        log.info("=" * 40 + " MANIFOLD " + "=" * 40)
+        # 3. Collect Manifold
+        _training_status["phase"] = "collecting_manifold"
+        _training_status["progress"] = "Starting Manifold..."
+        from ml.manifold_collector import ManifoldCollector
         manifold = ManifoldCollector(db)
         stats["manifold"] = await manifold.collect(max_markets=20000)
         await manifold.close()
+        _training_status["progress"] = f"Manifold: {stats['manifold']} new samples"
 
-        stats["total_in_db"] = await db.get_training_count()
-        stats["new_total"] = sum(v for k, v in stats.items() if k not in ("total_in_db",))
-        log.info(f"Collection complete: {stats['new_total']} new, {stats['total_in_db']} total in DB")
-    finally:
-        await db.close()
-    return stats
-
-
-async def run_train() -> dict:
-    from utils.db import Database
-    from ml.signal_model import SignalModel
-
-    db = Database()
-    await db.init()
-    try:
+        # 4. Train
+        _training_status["phase"] = "training"
+        _training_status["progress"] = "Loading training data..."
         samples = await db.get_training_data()
-        if not samples:
-            log.error("No training data. Run 'python main.py collect' first.")
-            return {"error": "no data"}
+        _training_status["progress"] = f"Training on {len(samples)} samples..."
 
-        model = SignalModel()
-        metrics = model.train(samples)
+        train_model = SignalModel()
+        metrics = train_model.train(samples)
 
         if "error" in metrics:
-            log.error(f"Training failed: {metrics['error']}")
-            return metrics
+            raise Exception(metrics["error"])
 
-        model_bytes = model.save_bytes()
+        # Save to DB
+        model_bytes = train_model.save_bytes()
         await db.save_model(model_bytes, metrics)
-        log.info(f"Model saved to DB ({len(model_bytes)} bytes)")
-        model.save_file("model.json")
 
-        log.info("=" * 50)
-        log.info(f"  Samples:     {metrics['n_total']} (train: {metrics['n_train']}, test: {metrics['n_test']})")
-        log.info(f"  YES rate:    {metrics['yes_rate']:.1%}")
-        log.info(f"  Test Brier:  {metrics['test_brier']:.4f}")
-        log.info(f"  Market Brier:{metrics.get('market_brier', 'N/A')}")
-        log.info(f"  Improvement: {metrics.get('brier_improvement', 'N/A')}")
-        log.info(f"  Accuracy:    {metrics['test_accuracy']:.1%}")
-        log.info(f"  Mispricing:  Acc={metrics.get('mis_accuracy', 'N/A')} Rate={metrics.get('mis_rate', 'N/A')}")
-        if "filtered_accuracy" in metrics:
-            log.info(f"  Filtered:    {metrics['filtered_count']} trades → Acc={metrics['filtered_accuracy']:.1%}")
-        log.info("=" * 50)
-        return metrics
-    finally:
-        await db.close()
+        # Hot-reload into serving model
+        model.load_bytes(model_bytes)
 
+        total_in_db = await db.get_training_count()
 
-async def run_serve():
-    import uvicorn
-    from fastapi import FastAPI, Query
-    from utils.db import Database
-    from ml.signal_model import SignalModel
-
-    app = FastAPI(title="Quant ML", docs_url="/")
-    model = SignalModel()
-    db = Database()
-
-    @app.on_event("startup")
-    async def startup():
-        await db.init()
-        model_bytes, metrics = await db.load_model()
-        if model_bytes:
-            model.load_bytes(model_bytes)
-            log.info(f"[SERVE] Model loaded. Metrics: Brier={metrics.get('test_brier')}, Acc={metrics.get('test_accuracy')}")
-        else:
-            log.warning("[SERVE] No model in DB — predictions will return defaults")
-
-    @app.on_event("shutdown")
-    async def shutdown():
-        await db.close()
-
-    @app.get("/predict")
-    async def predict(
-        yes_price: float = Query(...),
-        theme: str = Query("other"),
-        volume: float = Query(0),
-        days_to_expiry: int = Query(7),
-        market_age_days: float = Query(None),
-        price_momentum_7d: float = Query(None),
-        price_momentum_1d: float = Query(None),
-        price_volatility_7d: float = Query(None),
-        volume_per_day: float = Query(None),
-        neg_risk: bool = Query(False),
-        question_length: int = Query(50),
-        has_numbers: bool = Query(False),
-        spread: float = Query(None),
-        # New v2 features from engine
-        hurst: float = Query(None),
-        book_imbalance: float = Query(None),
-        contrarian_conf: float = Query(None),
-        n_evidence: int = Query(None),
-        volume_ratio: float = Query(None),
-    ):
-        features = {
-            "yes_price": yes_price,
-            "theme": theme,
-            "volume": volume,
-            "days_before_expiry": days_to_expiry,
-            "market_age_days": market_age_days,
-            "price_momentum_7d": price_momentum_7d,
-            "price_momentum_1d": price_momentum_1d,
-            "price_volatility_7d": price_volatility_7d,
-            "volume_per_day": volume_per_day,
-            "neg_risk": neg_risk,
-            "question_length": question_length,
-            "has_numbers": has_numbers,
-            "spread": spread,
-            "hurst": hurst,
-            "book_imbalance": book_imbalance,
-            "contrarian_conf": contrarian_conf,
-            "n_evidence": n_evidence,
-            "volume_ratio": volume_ratio,
+        _training_status["phase"] = "done"
+        _training_status["result"] = {
+            **metrics,
+            "collection": stats,
+            "total_in_db": total_in_db,
         }
-        result = model.predict(features)
-        return result
+        _training_status["progress"] = f"Done! Brier={metrics['test_brier']:.4f}, Acc={metrics['test_accuracy']:.1%}"
 
-    @app.get("/health")
-    async def health():
-        has_model = model.model is not None
-        has_mispricing = model.mispricing_model is not None
-        count = await db.get_training_count()
-        return {
-            "status": "ok" if has_model else "no_model",
-            "model_loaded": has_model,
-            "mispricing_loaded": has_mispricing,
-            "training_samples": count,
-        }
-
-    port = int(os.getenv("PORT", "8080"))
-    log.info(f"[SERVE] Starting on port {port}")
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-    server = uvicorn.Server(config)
-    await server.serve()
-
-
-async def main():
-    mode = os.getenv("ML_MODE") or (sys.argv[1] if len(sys.argv) > 1 else "serve")
-    log.info(f"QUANT ML — mode: {mode}")
-
-    if mode == "collect":
-        await run_collect()
-    elif mode == "train":
-        await run_train()
-    elif mode == "serve":
-        await run_serve()
-    elif mode == "all":
-        from utils.telegram import TelegramBot
-        tg = TelegramBot()
-
-        # Run collect+train in background while serving HTTP (prevents Railway health check timeout)
-        async def _collect_and_train():
-            try:
-                collect_stats = await run_collect()
-                train_metrics = await run_train()
-                return collect_stats, train_metrics
-            except Exception as e:
-                log.error(f"[ALL] Collect/train failed: {e}", exc_info=True)
-                return {}, {"error": str(e)}
-
-        bg_task = asyncio.create_task(_collect_and_train())
-
-        # Start serving immediately so Railway health check passes
-        import uvicorn
-        from fastapi import FastAPI, Query
-        from utils.db import Database as ServDB
-        from ml.signal_model import SignalModel
-
-        app = FastAPI(title="Quant ML")
-        model = SignalModel()
-        serve_db = ServDB()
-
-        @app.on_event("startup")
-        async def startup():
-            await serve_db.init()
-            model_bytes, metrics = await serve_db.load_model()
-            if model_bytes:
-                model.load_bytes(model_bytes)
-                log.info(f"[SERVE] Old model loaded while training. Brier={metrics.get('test_brier')}")
-
-        @app.get("/predict")
-        async def predict(
-            yes_price: float = Query(...), theme: str = Query("other"),
-            volume: float = Query(0), days_to_expiry: int = Query(7),
-            market_age_days: float = Query(None), price_momentum_7d: float = Query(None),
-            price_momentum_1d: float = Query(None), price_volatility_7d: float = Query(None),
-            volume_per_day: float = Query(None), neg_risk: bool = Query(False),
-            question_length: int = Query(50), has_numbers: bool = Query(False),
-            spread: float = Query(None), hurst: float = Query(None),
-            book_imbalance: float = Query(None), contrarian_conf: float = Query(None),
-            n_evidence: int = Query(None), volume_ratio: float = Query(None),
-        ):
-            features = {k: v for k, v in locals().items() if k != "self"}
-            return model.predict(features)
-
-        @app.get("/health")
-        async def health():
-            training = not bg_task.done()
-            return {"status": "training" if training else "ready",
-                    "model_loaded": model.model is not None}
-
-        port = int(os.getenv("PORT", "8080"))
-        log.info(f"[ALL] Serving on :{port} while collecting+training in background")
-        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
-        server = uvicorn.Server(config)
-
-        # Wait for both: serve + background training
-        serve_task = asyncio.create_task(server.serve())
-
-        # Wait for training to finish
-        collect_stats, train_metrics = await bg_task
-
-        # Send summary to Telegram
-        cs = collect_stats or {}
-        tm = train_metrics or {}
-        summary = (
-            f"🤖 <b>Quant ML — Training Complete</b>\n\n"
-            f"📊 <b>Data Collection</b>\n"
-            f"  Polymarket: {cs.get('polymarket', 0)} new\n"
-            f"  Kalshi: {cs.get('kalshi', 0)} new\n"
-            f"  Manifold: {cs.get('manifold', 0)} new\n"
-            f"  Total in DB: <b>{cs.get('total_in_db', '?')}</b>\n\n"
-        )
-        if "error" not in tm:
-            improvement = tm.get('brier_improvement', 0)
-            imp_emoji = "✅" if improvement > 0 else "⚠️"
-            summary += (
-                f"🧠 <b>Model Results</b>\n"
-                f"  Samples: {tm.get('n_total', '?')} (train: {tm.get('n_train', '?')}, test: {tm.get('n_test', '?')})\n"
-                f"  Model Brier: <b>{tm.get('test_brier', '?')}</b>\n"
-                f"  Market Brier: {tm.get('market_brier', '?')}\n"
-                f"  {imp_emoji} Improvement: <b>{improvement:+.4f}</b>\n"
-                f"  Accuracy: <b>{tm.get('test_accuracy', 0):.1%}</b>\n\n"
-                f"🔍 <b>Mispricing Model</b>\n"
-                f"  Accuracy: {tm.get('mis_accuracy', '?')}\n"
-                f"  Mispricing rate: {tm.get('mis_rate', '?')}\n"
+        # Telegram notification
+        try:
+            from utils.telegram import TelegramBot
+            tg = TelegramBot()
+            improvement = metrics.get('brier_improvement', 0)
+            await tg.send(
+                f"🤖 <b>ML Training Complete</b>\n\n"
+                f"📊 Data: {total_in_db} samples\n"
+                f"  +Poly: {stats['polymarket']}, +Kalshi: {stats['kalshi']}, +Manifold: {stats['manifold']}\n\n"
+                f"🧠 Brier: <b>{metrics['test_brier']:.4f}</b> (market: {metrics.get('market_brier', '?')})\n"
+                f"{'✅' if improvement > 0 else '⚠️'} Improvement: <b>{improvement:+.4f}</b>\n"
+                f"Accuracy: <b>{metrics['test_accuracy']:.1%}</b>\n"
+                f"Mispricing: {metrics.get('mis_accuracy', '?')} acc, {metrics.get('mis_rate', '?')} rate"
             )
-            if "filtered_accuracy" in tm:
-                summary += f"  Filtered: {tm['filtered_count']} trades → <b>{tm['filtered_accuracy']:.1%}</b> acc\n"
-            top_feats = list(tm.get("feature_importance", {}).items())[:3]
-            if top_feats:
-                summary += "\n📈 Top features: " + ", ".join(f"{k}={v:.2f}" for k, v in top_feats)
-        else:
-            summary += f"❌ Training failed: {tm.get('error', 'unknown')}"
+            await tg.close()
+        except Exception as e:
+            log.warning(f"[TRAIN] Telegram failed: {e}")
 
-        await tg.send(summary)
-        await tg.close()
-        log.info("[ML] Telegram summary sent")
+    except Exception as e:
+        _training_status["phase"] = "error"
+        _training_status["error"] = str(e)
+        _training_status["progress"] = f"Error: {e}"
+        log.error(f"[TRAIN] Failed: {e}", exc_info=True)
+    finally:
+        _training_status["running"] = False
+        _training_status["finished_at"] = datetime.now(timezone.utc).isoformat()
 
-        await run_serve()
-    else:
-        log.error(f"Unknown mode: {mode}. Use: collect, train, serve, all")
 
+@app.post("/api/train")
+async def start_training(background_tasks: BackgroundTasks):
+    """Start collect + train in background. Returns immediately."""
+    if _training_status["running"]:
+        return JSONResponse({"error": "Training already running", "status": _training_status}, status_code=409)
+    background_tasks.add_task(_run_collect_and_train)
+    return {"message": "Training started", "status": "collecting_polymarket"}
+
+
+@app.post("/api/train-only")
+async def start_train_only(background_tasks: BackgroundTasks):
+    """Train on existing data without collecting new. Fast."""
+    if _training_status["running"]:
+        return JSONResponse({"error": "Training already running"}, status_code=409)
+
+    async def _train_only():
+        global _training_status
+        _training_status["running"] = True
+        _training_status["phase"] = "training"
+        _training_status["started_at"] = datetime.now(timezone.utc).isoformat()
+        _training_status["error"] = None
+        try:
+            samples = await db.get_training_data()
+            _training_status["progress"] = f"Training on {len(samples)} samples..."
+            train_model = SignalModel()
+            metrics = train_model.train(samples)
+            if "error" in metrics:
+                raise Exception(metrics["error"])
+            model_bytes = train_model.save_bytes()
+            await db.save_model(model_bytes, metrics)
+            model.load_bytes(model_bytes)
+            _training_status["phase"] = "done"
+            _training_status["result"] = metrics
+            _training_status["progress"] = f"Done! Brier={metrics['test_brier']:.4f}"
+        except Exception as e:
+            _training_status["phase"] = "error"
+            _training_status["error"] = str(e)
+            _training_status["progress"] = f"Error: {e}"
+        finally:
+            _training_status["running"] = False
+            _training_status["finished_at"] = datetime.now(timezone.utc).isoformat()
+
+    background_tasks.add_task(_train_only)
+    return {"message": "Training started (existing data)", "status": "training"}
+
+
+# ── Run ──
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    port = int(os.getenv("PORT", "8080"))
+    log.info(f"[ML] Starting server on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port, log_level="info")
