@@ -200,8 +200,67 @@ async def main():
         from utils.telegram import TelegramBot
         tg = TelegramBot()
 
-        collect_stats = await run_collect()
-        train_metrics = await run_train()
+        # Run collect+train in background while serving HTTP (prevents Railway health check timeout)
+        async def _collect_and_train():
+            try:
+                collect_stats = await run_collect()
+                train_metrics = await run_train()
+                return collect_stats, train_metrics
+            except Exception as e:
+                log.error(f"[ALL] Collect/train failed: {e}", exc_info=True)
+                return {}, {"error": str(e)}
+
+        bg_task = asyncio.create_task(_collect_and_train())
+
+        # Start serving immediately so Railway health check passes
+        import uvicorn
+        from fastapi import FastAPI, Query
+        from utils.db import Database as ServDB
+        from ml.signal_model import SignalModel
+
+        app = FastAPI(title="Quant ML")
+        model = SignalModel()
+        serve_db = ServDB()
+
+        @app.on_event("startup")
+        async def startup():
+            await serve_db.init()
+            model_bytes, metrics = await serve_db.load_model()
+            if model_bytes:
+                model.load_bytes(model_bytes)
+                log.info(f"[SERVE] Old model loaded while training. Brier={metrics.get('test_brier')}")
+
+        @app.get("/predict")
+        async def predict(
+            yes_price: float = Query(...), theme: str = Query("other"),
+            volume: float = Query(0), days_to_expiry: int = Query(7),
+            market_age_days: float = Query(None), price_momentum_7d: float = Query(None),
+            price_momentum_1d: float = Query(None), price_volatility_7d: float = Query(None),
+            volume_per_day: float = Query(None), neg_risk: bool = Query(False),
+            question_length: int = Query(50), has_numbers: bool = Query(False),
+            spread: float = Query(None), hurst: float = Query(None),
+            book_imbalance: float = Query(None), contrarian_conf: float = Query(None),
+            n_evidence: int = Query(None), volume_ratio: float = Query(None),
+        ):
+            features = {k: v for k, v in locals().items() if k != "self"}
+            return model.predict(features)
+
+        @app.get("/health")
+        async def health():
+            training = not bg_task.done()
+            return {"status": "training" if training else "ready",
+                    "model_loaded": model.model is not None}
+
+        port = int(os.getenv("PORT", "8080"))
+        log.info(f"[ALL] Serving on :{port} while collecting+training in background")
+        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info")
+        server = uvicorn.Server(config)
+
+        # Wait for both: serve + background training
+        serve_task = asyncio.create_task(server.serve())
+
+        # Wait for training to finish
+        collect_stats, train_metrics = await bg_task
 
         # Send summary to Telegram
         cs = collect_stats or {}
