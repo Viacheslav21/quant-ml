@@ -101,8 +101,8 @@ class Database:
                         s.get("question_length"), s.get("has_numbers", False),
                         s.get("spread"), s.get("mispricing"))
                     inserted += 1
-                except Exception:
-                    pass
+                except Exception as e:
+                    log.warning(f"[DB] Insert failed for {s.get('market_id', '?')}: {e}")
         return inserted
 
     async def get_training_data(self) -> list:

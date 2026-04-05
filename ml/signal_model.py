@@ -62,8 +62,11 @@ class SignalModel:
 
         log.info(f"[MODEL] Training on {len(df)} samples ({df['outcome'].sum()} YES, {len(df) - df['outcome'].sum()} NO)")
 
-        # Time-series split
-        df = df.sort_values("market_age_days", ascending=True, na_position="first").reset_index(drop=True)
+        # Time-series split — sort chronologically to prevent data leakage
+        if "collected_at" in df.columns:
+            df = df.sort_values("collected_at", ascending=True, na_position="first").reset_index(drop=True)
+        else:
+            df = df.sort_values("id", ascending=True).reset_index(drop=True)
         split_idx = int(len(df) * 0.75)
         train_df = df.iloc[:split_idx]
         test_df = df.iloc[split_idx:]
